@@ -53,7 +53,8 @@ import time
 import numpy as np
 import tensorflow as tf
 
-from tensorflow.models.rnn.ptb import reader
+#from tensorflow.models.rnn.ptb import reader
+import myreader as reader
 
 flags = tf.flags
 logging = tf.logging
@@ -65,9 +66,10 @@ flags.DEFINE_string("data_path", None, "data_path")
 flags.DEFINE_string("checkpoint_dir", "ckpt", "checkpoint_dir")
 flags.DEFINE_bool("use_fp16", False,
                   "Train using 16-bit floats instead of 32bit floats")
+flags.DEFINE_bool("train", False,
+                  "should we train or test")
 
 FLAGS = flags.FLAGS
-
 
 def data_type():
   return tf.float16 if FLAGS.use_fp16 else tf.float32
@@ -110,29 +112,32 @@ class PTBModel(object):
     #
     # The alternative version of the code below is:
     #
-    # from tensorflow.models.rnn import rnn
-    # inputs = [tf.squeeze(input_, [1])
-    #           for input_ in tf.split(1, num_steps, inputs)]
-    # outputs, state = rnn.rnn(cell, inputs, initial_state=self._initial_state)
-    outputs = []
-    state = self._initial_state
-    with tf.variable_scope("RNN"):
-      for time_step in range(num_steps):
-        if time_step > 0: tf.get_variable_scope().reuse_variables()
-        (cell_output, state) = cell(inputs[:, time_step, :], state)
-        outputs.append(cell_output)
+    #from tensorflow.models.rnn import rnn
+    inputs = [tf.squeeze(input_, [1])
+              for input_ in tf.split(1, num_steps, inputs)]
+    outputs, state = tf.nn.rnn(cell, inputs, initial_state=self._initial_state)
+    #outputs = []
+    #state = self._initial_state
+    #with tf.variable_scope("RNN"):
+    #  for time_step in range(num_steps):
+    #    if time_step > 0: tf.get_variable_scope().reuse_variables()
+    #    (cell_output, state) = cell(inputs[:, time_step, :], state)
+    #    outputs.append(cell_output)
 
     output = tf.reshape(tf.concat(1, outputs), [-1, size])
     softmax_w = tf.get_variable(
         "softmax_w", [size, vocab_size], dtype=data_type())
     softmax_b = tf.get_variable("softmax_b", [vocab_size], dtype=data_type())
     logits = tf.matmul(output, softmax_w) + softmax_b
+
     loss = tf.nn.seq2seq.sequence_loss_by_example(
         [logits],
         [tf.reshape(self._targets, [-1])],
         [tf.ones([batch_size * num_steps], dtype=data_type())])
     self._cost = cost = tf.reduce_sum(loss) / batch_size
     self._final_state = state
+    # RANI
+    self.logits = logits
 
     if not is_training:
       return
@@ -244,7 +249,7 @@ class TestConfig(object):
   vocab_size = 10000
 
 
-def run_epoch(session, model, data, eval_op, verbose=False):
+def run_epoch(session, model, inverseDictionary, data, eval_op, verbose=False):
   """Runs the model on the given data."""
   epoch_size = ((len(data) // model.batch_size) - 1) // model.num_steps
   start_time = time.time()
@@ -253,16 +258,20 @@ def run_epoch(session, model, data, eval_op, verbose=False):
   state = session.run(model.initial_state)
   for step, (x, y) in enumerate(reader.ptb_iterator(data, model.batch_size,
                                                     model.num_steps)):
-    fetches = [model.cost, model.final_state, eval_op]
+
+    fetches = [model.cost, model.final_state, model.logits, eval_op]
     feed_dict = {}
     feed_dict[model.input_data] = x
     feed_dict[model.targets] = y
     for i, (c, h) in enumerate(model.initial_state):
       feed_dict[c] = state[i].c
       feed_dict[h] = state[i].h
-    cost, state, _ = session.run(fetches, feed_dict)
+    cost, state, logits, _ = session.run(fetches, feed_dict)
     costs += cost
     iters += model.num_steps
+    # Rani: show the actual prediction
+    decodedWordId = int(np.argmax(logits))
+    print (" ".join([inverseDictionary[int(x1)] for x1 in np.nditer(x)]) + " got:" + inverseDictionary[decodedWordId] + " expected:" + inverseDictionary[int(y)])
 
     if verbose and step % (epoch_size // 10) == 10:
       print("%.3f perplexity: %.3f speed: %.0f wps" %
@@ -290,7 +299,10 @@ def main(_):
     raise ValueError("Must set --data_path to PTB data directory")
 
   raw_data = reader.ptb_raw_data(FLAGS.data_path)
-  train_data, valid_data, test_data, _ = raw_data
+  train_data, valid_data, test_data, _, word_to_id = raw_data
+  # Rani: added inverseDictionary
+  inverseDictionary = dict(zip(word_to_id.values(), word_to_id.keys()))
+  
 
   config = get_config()
   eval_config = get_config()
@@ -308,29 +320,33 @@ def main(_):
 
     saver = tf.train.Saver()
     tf.initialize_all_variables().run()
-    if False:
+    if FLAGS.train: 
+      print ('training')
 
       for i in range(config.max_max_epoch):
         lr_decay = config.lr_decay ** max(i - config.max_epoch, 0.0)
         m.assign_lr(session, config.learning_rate * lr_decay)
 
         print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-        train_perplexity = run_epoch(session, m, train_data, m.train_op,
+        train_perplexity = run_epoch(session, m, inverseDictionary, train_data, m.train_op,
                                     verbose=True)
         print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-        valid_perplexity = run_epoch(session, mvalid, valid_data, tf.no_op())
+        valid_perplexity = run_epoch(session, mvalid, inverseDictionary, valid_data, tf.no_op())
         print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
-        saver.save(session, FLAGS.checkpoint_dir + 'model.ckpt', global_step=i+1)
+        saver.save(session, FLAGS.checkpoint_dir + '/model.ckpt', global_step=i+1)
     else:
-        ckpt = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
+        print ('testing')
+        ckpt = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir )
+        print (ckpt)
         if ckpt and ckpt.model_checkpoint_path:
             saver.restore(session, ckpt.model_checkpoint_path)
         else:
             print ("No checkpoint file found")
 
-    test_perplexity = run_epoch(session, mtest, test_data, tf.no_op())
+    test_perplexity = run_epoch(session, mtest, inverseDictionary, test_data, tf.no_op())
     print("Test Perplexity: %.3f" % test_perplexity)
 
 
 if __name__ == "__main__":
   tf.app.run()
+  #print (FLAGS.checkpoint_dir)
